@@ -1,3 +1,4 @@
+#include <deep_gemm/mega_moe_trace.cuh>
 #pragma once
 
 #include <torch/python.h>
@@ -25,6 +26,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        deep_gemm::trace::EventBuffer trace_buf;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -103,7 +105,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.tensor_map_l2_weights_sf
+            args.tensor_map_l2_weights_sf,
+            args.trace_buf
         ));
     }
 };
@@ -184,6 +187,17 @@ static void sm100_fp8_fp4_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
+    //--------Mega-Moe Trace --------- //
+    // Allocate trace buffer
+    deep_gemm::trace::EventBuffer trace_buf_h;
+    trace_buf_h.capacity = deep_gemm::trace::kMaxEvents;
+    cudaMalloc(&trace_buf_h.events,  trace_buf_h.capacity * sizeof(deep_gemm::trace::Event));
+    cudaMalloc(&trace_buf_h.counter, sizeof(uint32_t));
+    cudaMemset(trace_buf_h.counter, 0, sizeof(uint32_t));
+    //--------Mega-Moe Trace --------- //
+
+    // Pass trace_buf_h to kernel as an extra argument (you'll need to add it to the signature)
+
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const SM100FP8FP4MegaMoERuntime::Args args = {
@@ -193,6 +207,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .trace_buf = trace_buf_h,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -215,6 +230,33 @@ static void sm100_fp8_fp4_mega_moe(
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+
+    //--------Mega-Moe Trace --------- //
+    cudaDeviceSynchronize();
+    // Pull events back
+    uint32_t n_events = 0;
+    cudaMemcpy(&n_events, trace_buf_h.counter, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    n_events = std::min(n_events, trace_buf_h.capacity);
+
+    std::vector<deep_gemm::trace::Event> events(n_events);
+    cudaMemcpy(events.data(), trace_buf_h.events,
+               n_events * sizeof(deep_gemm::trace::Event), cudaMemcpyDeviceToHost);
+
+    // Dump to CSV for post-processing
+    FILE* f = fopen("mega_moe_trace.csv", "w");
+    fprintf(f, "sm,warp_role,event_id,wave,aux,t_start_ns,t_end_ns,dur_ns\n");
+    for (const auto& e : events) {
+        fprintf(f, "%u,%u,%u,%u,%u,%llu,%llu,%lld\n",
+                e.sm_id, e.warp_role, e.event_id, e.wave_idx, e.aux,
+                (unsigned long long)e.t_start,
+                (unsigned long long)e.t_end,
+                (long long)(e.t_end - e.t_start));
+    }
+    fclose(f);
+
+    cudaFree(trace_buf_h.events);
+    cudaFree(trace_buf_h.counter);
+    //--------Mega-Moe Trace --------- //
 }
 
 } // namespace deep_gemm

@@ -1,4 +1,5 @@
 #pragma once
+#include <deep_gemm/mega_moe_trace.cuh>
 
 #include <cstdint>
 #include <cutlass/arch/barrier.h>
@@ -59,23 +60,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            deep_gemm::trace::EventBuffer trace_buf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
+    
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-
+    
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t sm_idx = blockIdx.x;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+
+    // // At the very top of sm100_fp8_fp4_mega_moe_impl, right after thread_idx setup
+    // if (warp_idx == 0 and cute::elect_one_sync())
+    //     deep_gemm::trace::record(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_KERNEL_BEGIN,
+    //                             deep_gemm::trace::now_ns(), 0, 0xFFFFFFFFu, 0);
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -457,6 +465,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+        // TRACE_BEGIN(t_dispatch);
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -601,6 +610,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+        // TRACE_END(trace_buf, deep_gemm::trace::WR_DISPATCH, deep_gemm::trace::EV_DISPATCH_PHASE, t_dispatch, 0xFFFFFFFFu, warp_idx);
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -680,10 +690,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Wait the entire token arrival for linear 1
             if (block_phase == sched::BlockPhase::Linear1) {
+                // TRACE_BEGIN(t_wait);
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected);
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L1_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
             } else {
+                // TRACE_BEGIN(t_wait);
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
                 // with L2, but this optimization is negative when `num_experts_per_wave`
@@ -696,11 +709,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // to avoid undefined behavior when `num_k_blocks == 32`
                 const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
                 while (ptx::ld_acq_gpu(ptr) != expected);
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L2_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
             }
-
+            
+            TRACE_BEGIN(t_expert);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
+                // TRACE_BEGIN(t_eb);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_EMPTY_BARRIER_WAIT, t_eb, wave,
+                //         (local_expert_idx << 16) | k_block_idx);
 
                 // Compute token offset from pool block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -712,6 +730,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (not is_leader_cta)
                     m_idx += scheduler.template get_valid_m<true>() / 2;
 
+                // TRACE_BEGIN(t_tma);
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
@@ -725,7 +744,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_TMA_LOAD_A_BLOCK, t_tma, wave,
+                //   (local_expert_idx << 16) | k_block_idx);
             }
+            //  TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A,
+            //   block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
+            //   t_expert, wave, local_expert_idx);
         });
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
@@ -809,10 +833,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
-                tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
+
+                const uint32_t wave = scheduler.wave_idx;
+                
+                // TRACE_BEGIN(t_tmem_wait);
+                // tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_TMEM_EMPTY_WAIT, t_tmem_wait, wave, local_expert_idx);
+
                 ptx::tcgen05_after_thread_sync();
 
                 // Empty barrier arrival
+                // TRACE_BEGIN(t_umma);
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
                     auto umma_arrive = [](const uint64_t* barrier) {
                         constexpr uint16_t kCTAMask = (1 << 2) - 1;
@@ -825,6 +856,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
                     __syncwarp();
                 };
+                // TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_UMMA_ISSUE, t_umma, wave, local_expert_idx);
 
                 // Launch MMAs
                 #pragma unroll 2
@@ -928,7 +960,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+
+            const uint32_t wave = scheduler.wave_idx;
+            
+            // TRACE_BEGIN(t_tmem_full);
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+            // TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE, deep_gemm::trace::EV_TMEM_FULL_WAIT, t_tmem_full, wave, local_expert_idx);
+            
             ptx::tcgen05_after_thread_sync();
 
             // Compute offsets
@@ -938,6 +976,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
+            // TRACE_BEGIN(t_epi);
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -1223,6 +1262,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
         });
+
+        // TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE,
+        //     block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
+        //     t_epi, wave, local_expert_idx);
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs

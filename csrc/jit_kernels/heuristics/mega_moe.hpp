@@ -200,6 +200,26 @@ static MegaMoEConfig get_mega_moe_config(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 
+    // === [TRACE] Host-side wave summary ===========================================
+    // Each kernel launch processes the rank's experts in groups of `num_experts_per_wave`.
+    // Total number of waves = ceil(num_experts_per_rank / num_experts_per_wave).
+    // (The scheduler asserts this divides evenly.)
+    {
+        const int num_waves = num_experts_per_rank / num_experts_per_wave;
+        static std::unordered_set<std::string> printed_wave_keys;
+        const auto wave_key = fmt::format(
+            "{}-{}-{}-{}", num_experts_per_rank, num_experts_per_wave, num_tokens, num_topk);
+        if (printed_wave_keys.count(wave_key) == 0) {
+            std::cout << "[MegaMoE TRACE host] num_experts_per_rank=" << num_experts_per_rank
+                      << ", num_experts_per_wave=" << num_experts_per_wave
+                      << ", total_waves_per_launch=" << num_waves
+                      << "  (num_tokens=" << num_tokens
+                      << ", num_topk=" << num_topk << ")" << std::endl;
+            printed_wave_keys.insert(wave_key);
+        }
+    }
+    // === [/TRACE] =================================================================
+
     // Thread layout
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
@@ -226,8 +246,8 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, num_experts_per_wave={}, block_m={}, block_n={}, block_k={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk, num_experts_per_wave, block_m, block_n, block_k);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

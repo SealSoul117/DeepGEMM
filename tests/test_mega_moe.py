@@ -36,11 +36,13 @@ def import_baseline():
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    # import deep_ep
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
 
     # Settings
+
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -128,78 +130,82 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
-    # Only do NCU profiling
-    if args.ncu_profile_only:
-        create_inputs()
-        dist_print(f'Run fused kernel:', once_in_node=True)
-        run_fused()
-        dist_print(f' > Done, exiting', once_in_node=True)
+    # # Non-overlapped baseline: EP dispatch + GEMM + EP combine
+    # deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    # alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+    # deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+    # ep_buffer = deep_ep.ElasticBuffer(
+    #     group,
+    #     num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden,
+    #     num_topk=num_topk, use_fp8_dispatch=True,
+    #     explicitly_destroy=True,
+    #     allow_multiple_reduction=False,
+    #     num_gpu_timeout_secs=10, num_cpu_timeout_secs=30,
+    #     allow_hybrid_mode=False
+    # ) if is_legacy_loaded else None
 
-        # Destroy and exit
-        dist.barrier()
-        buffer.destroy()
-        dist.destroy_process_group()
-        return
+    # def run_baseline():
+    #     recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
+    #         x, topk_idx=topk_idx, topk_weights=topk_weights,
+    #         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_baseline,
+    #         num_experts=num_experts, expert_alignment=alignment,
+    #         do_cpu_sync=False, do_handle_copy=False,
+    #         do_expand=True, use_tma_aligned_col_major_sf=True,
+    #     )
+    #     n = recv_x[0].size(0)
+    #     l1_y = torch.empty((n, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
+    #     deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+    #         recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert,
+    #         use_psum_layout=True, recipe=(1, 1, 32))
+    #     # noinspection PyCallingNonCallable
+    #     l1_y = tilelang_ops.swiglu_apply_weight_to_fp8(
+    #         x=l1_y,
+    #         topk_weights=recv_topk_weights,
+    #         avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
+    #         num_per_channels=32,
+    #         use_col_major_scales=True,
+    #         round_scale=True,
+    #         ue8m0_scale=True,
+    #         output_bf16=False,
+    #         clamp_value=args.activation_clamp,
+    #         fast_math=bool(args.fast_math)
+    #     )
+    #     l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device='cuda')
+    #     deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+    #         l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert,
+    #         use_psum_layout=True, recipe=(1, 1, 32))
+    #     return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
+    
+    #     # Only do NCU profiling
+    # if args.ncu_profile_only:
+    #     create_inputs()
+    #     dist_print(f'Run fused kernel:', once_in_node=True)
+    #     run_baseline()
+    #     run_fused()
+    #     dist_print(f' > Done, exiting', once_in_node=True)
 
-    # Non-overlapped baseline: EP dispatch + GEMM + EP combine
-    deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
-    alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
-    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
-    ep_buffer = deep_ep.ElasticBuffer(
-        group,
-        num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden,
-        num_topk=num_topk, use_fp8_dispatch=True,
-        explicitly_destroy=True,
-        allow_multiple_reduction=False,
-        gpu_timeout_secs=10, cpu_timeout_secs=30
-    ) if is_legacy_loaded else None
-
-    def run_baseline():
-        recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
-            x, topk_idx=topk_idx, topk_weights=topk_weights,
-            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_baseline,
-            num_experts=num_experts, expert_alignment=alignment,
-            do_cpu_sync=False, do_handle_copy=False,
-            do_expand=True, use_tma_aligned_col_major_sf=True,
-        )
-        n = recv_x[0].size(0)
-        l1_y = torch.empty((n, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-            recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert,
-            use_psum_layout=True, recipe=(1, 1, 32))
-        # noinspection PyCallingNonCallable
-        l1_y = tilelang_ops.swiglu_apply_weight_to_fp8(
-            x=l1_y,
-            topk_weights=recv_topk_weights,
-            avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
-            num_per_channels=32,
-            use_col_major_scales=True,
-            round_scale=True,
-            ue8m0_scale=True,
-            output_bf16=False,
-            clamp_value=args.activation_clamp,
-            fast_math=bool(args.fast_math)
-        )
-        l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-            l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert,
-            use_psum_layout=True, recipe=(1, 1, 32))
-        return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
+    #     # Destroy and exit
+    #     dist.barrier()
+    #     buffer.destroy()
+    #     dist.destroy_process_group()
+    #     return
 
     # Check correctness (must be bitwise identical)
-    num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
-    # noinspection PyBroadException
-    if is_legacy_loaded and num_correctness_tests > 0:
-        dist_print('Running correctness tests:', once_in_node=True)
-        for i in range(num_correctness_tests):
-            create_inputs()
-            for fused_result, baseline_result in zip(run_fused(), run_baseline()):
-                assert torch.equal(fused_result, baseline_result)
-            if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
-                dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
-        dist_print(once_in_node=True)
-    else:
-        create_inputs()
+    # num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
+    # # noinspection PyBroadException
+    # if is_legacy_loaded and num_correctness_tests > 0:
+    #     dist_print('Running correctness tests:', once_in_node=True)
+    #     for i in range(num_correctness_tests):
+    #         create_inputs()
+    #         for fused_result, baseline_result in zip(run_fused(), run_baseline()):
+    #             assert torch.equal(fused_result, baseline_result)
+    #         if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
+    #             dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
+    #     dist_print(once_in_node=True)
+    # else:
+    #     create_inputs()
+
+    create_inputs()
 
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -210,9 +216,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Benchmark
     t_fused = bench_kineto(
         run_fused, 'mega_moe',
-        barrier=lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.barrier(),
+        barrier=dist.barrier(),
         trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json')
-    t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
+    # t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
@@ -247,13 +253,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f'HBM {hbm_gbs * approx_factor:4.0f} GB/s, '
                f'NVL {nvlink_gbs * approx_factor:3.0f} GB/s | '
                f'{t_fused * 1e6:4.0f} us, '
-               f'reduction: {t_reduction * 1e6:4.1f} us | '
-               f'{safe_div(t_baseline, t_fused):.2f}x legacy')
+               f'reduction: {t_reduction * 1e6:4.1f} us | ')
 
     # Exit
     dist.barrier()
     buffer.destroy()
-    ep_buffer.destroy() if is_legacy_loaded else None
+    # ep_buffer.destroy() if is_legacy_loaded else None
     dist.destroy_process_group()
 
 

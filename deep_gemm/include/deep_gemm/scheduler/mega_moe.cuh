@@ -54,6 +54,14 @@ struct MegaMoEScheduler {
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
 
+    // === [TRACE] per-scheduler wave tracking =================================
+    // Each warp that calls `for_each_block` keeps its own scheduler instance,
+    // so these counters are per-(SM, role-warp).
+    uint32_t wave_idx = 0;
+    uint32_t l1_blocks_this_wave = 0;
+    uint32_t l2_blocks_this_wave = 0;
+    // === [/TRACE] ============================================================
+
     // Pre-cached per-expert token counts (filled during `for_each_block` init)
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
@@ -87,10 +95,11 @@ struct MegaMoEScheduler {
         return __reduce_add_sync(0xffffffff, num_blocks);
     }
 
-    CUTLASS_DEVICE void advance_expert_idx() {
+    CUTLASS_DEVICE void advance_expert_idx() {        
+
         current_pool_block_offset += get_current_num_m_blocks();
         current_local_expert_idx += 1;
-        current_num_tokens = get_num_tokens(current_local_expert_idx);
+        current_num_tokens = get_num_tokens(current_local_expert_idx);   
     }
 
     CUTLASS_DEVICE void set_expert_idx(const uint32_t& expert_idx) {
@@ -118,6 +127,21 @@ struct MegaMoEScheduler {
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             m_block_idx = block_idx / kNumL1BlockNs;
+
+            // // [TRACE] count non-empty experts in current wave
+            // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+            //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  wave=%u  block_idx=%u  kNumL1BlockNs=%u  num_m_blocks=%u. advance?=%u\n",
+            //         threadIdx.x, wave_idx, block_idx, kNumL1BlockNs, num_m_blocks, m_block_idx < num_m_blocks);
+            // }
+            // // [/TRACE]
+
+            // // [TRACE] count non-empty experts in current wave
+            // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+            //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  wave=%u  expert %u has %u tokens\n",
+            //         threadIdx.x, wave_idx, current_local_expert_idx, current_num_tokens);
+            // }
+            // // [/TRACE]
+
             if (m_block_idx < num_m_blocks)
                 return true;
 
@@ -156,8 +180,19 @@ struct MegaMoEScheduler {
                     n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
                     // Jump to next block
                     block_idx += kNumSMs;
+                    // // === [TRACE] count L1 blocks this SM owns in current wave ===
+                    // ++ l1_blocks_this_wave;
+                    // // === [/TRACE] ===============================================
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
+                    // // === [TRACE] L1 of current wave done, about to start L2 ====
+                    // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+                    //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  wave=%u  L1 DONE  "
+                    //            "(this SM ran %u L1 blocks)  -> switching to L2 (same wave)\n",
+                    //            threadIdx.x, wave_idx, l1_blocks_this_wave);
+                    // }
+                    // // === [/TRACE] ===============================================
+
                     // L1 for the current wave is complete, transition to L2
                     next_phase = BlockPhase::Linear2;
                     set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
@@ -168,13 +203,34 @@ struct MegaMoEScheduler {
                     n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
                     // Jump to next block
                     block_idx += kNumSMs;
+                    // // === [TRACE] count L2 blocks this SM owns in current wave ===
+                    // ++ l2_blocks_this_wave;
+                    // // === [/TRACE] ===============================================
                     return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
+                    // // === [TRACE] L2 of current wave done, advancing wave =======
+                    // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+                    //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  wave=%u  L2 DONE  "
+                    //            "(this SM ran %u L2 blocks)  -> advancing to wave %u\n",
+                    //            threadIdx.x, wave_idx, l2_blocks_this_wave, wave_idx + 1);
+                    // }
+                    // l1_blocks_this_wave = 0;
+                    // l2_blocks_this_wave = 0;
+                    ++ wave_idx;
+                    // // === [/TRACE] ===============================================
+
                     // Move to L1 of the next wave
                     next_phase = BlockPhase::Linear1;
                 }
             }
         }
+
+        // // === [TRACE] kernel end =====================================================
+        // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+        //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  ALL DONE  (processed %u waves total)\n",
+        //            threadIdx.x, wave_idx);
+        // }
+        // // === [/TRACE] ===============================================================
 
         // All waves and experts are fully processed
         return {BlockPhase::None, 0, 0, 0};
@@ -203,6 +259,19 @@ struct MegaMoEScheduler {
 
         // Initialize current expert with 0
         set_expert_idx(0);
+
+        // // === [TRACE] kernel begin ===================================================
+        // // Print once per role-warp on SM 0. With 4 callers of `for_each_block`
+        // // (TMA-load-A, TMA-load-B, MMA, Epilogue), you will see 4 lines here.
+        // if (blockIdx.x == 0 and cute::elect_one_sync()) {
+        //     constexpr uint32_t kTotalWaves = kNumExpertsPerRank / kNumExpertsPerWave;
+        //     printf("[MegaMoE TRACE dev] SM0 tid=%3u  KERNEL BEGIN  "
+        //            "kNumExpertsPerRank=%u  kNumExpertsPerWave=%u  total_waves=%u  kNumSMs=%u\n",
+        //            threadIdx.x,
+        //            (unsigned) kNumExpertsPerRank, (unsigned) kNumExpertsPerWave,
+        //            (unsigned) kTotalWaves, (unsigned) kNumSMs);
+        // }
+        // // === [/TRACE] ===============================================================
 
         // Iterate over all blocks
         // TODO: add swizzle within expert waves for better L2 cache utilization
