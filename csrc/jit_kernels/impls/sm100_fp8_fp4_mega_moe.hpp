@@ -231,32 +231,32 @@ static void sm100_fp8_fp4_mega_moe(
     const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 
-    //--------Mega-Moe Trace --------- //
-    cudaDeviceSynchronize();
-    // Pull events back
-    uint32_t n_events = 0;
-    cudaMemcpy(&n_events, trace_buf_h.counter, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    n_events = std::min(n_events, trace_buf_h.capacity);
+    // //--------Mega-Moe Trace --------- //
+    // cudaDeviceSynchronize();
+    // // Pull events back
+    // uint32_t n_events = 0;
+    // cudaMemcpy(&n_events, trace_buf_h.counter, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    // n_events = std::min(n_events, trace_buf_h.capacity);
 
-    std::vector<deep_gemm::trace::Event> events(n_events);
-    cudaMemcpy(events.data(), trace_buf_h.events,
-               n_events * sizeof(deep_gemm::trace::Event), cudaMemcpyDeviceToHost);
+    // std::vector<deep_gemm::trace::Event> events(n_events);
+    // cudaMemcpy(events.data(), trace_buf_h.events,
+    //            n_events * sizeof(deep_gemm::trace::Event), cudaMemcpyDeviceToHost);
 
-    // Dump to CSV for post-processing
-    FILE* f = fopen("mega_moe_trace.csv", "w");
-    fprintf(f, "sm,warp_role,event_id,wave,aux,t_start_ns,t_end_ns,dur_ns\n");
-    for (const auto& e : events) {
-        fprintf(f, "%u,%u,%u,%u,%u,%llu,%llu,%lld\n",
-                e.sm_id, e.warp_role, e.event_id, e.wave_idx, e.aux,
-                (unsigned long long)e.t_start,
-                (unsigned long long)e.t_end,
-                (long long)(e.t_end - e.t_start));
-    }
-    fclose(f);
+    // // Dump to CSV for post-processing
+    // FILE* f = fopen("mega_moe_trace.csv", "w");
+    // fprintf(f, "sm,warp_role,event_id,wave,aux,t_start_ns,t_end_ns,dur_ns\n");
+    // for (const auto& e : events) {
+    //     fprintf(f, "%u,%u,%u,%u,%u,%llu,%llu,%lld\n",
+    //             e.sm_id, e.warp_role, e.event_id, e.wave_idx, e.aux,
+    //             (unsigned long long)e.t_start,
+    //             (unsigned long long)e.t_end,
+    //             (long long)(e.t_end - e.t_start));
+    // }
+    // fclose(f);
 
-    cudaFree(trace_buf_h.events);
-    cudaFree(trace_buf_h.counter);
-    //--------Mega-Moe Trace --------- //
+    // cudaFree(trace_buf_h.events);
+    // cudaFree(trace_buf_h.counter);
+    // //--------Mega-Moe Trace --------- //
 }
 
 } // namespace deep_gemm

@@ -712,7 +712,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L2_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
             }
             
-            TRACE_BEGIN(t_expert);
+            // TRACE_BEGIN(t_expert);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 // TRACE_BEGIN(t_eb);

@@ -204,20 +204,20 @@ static MegaMoEConfig get_mega_moe_config(
     // Each kernel launch processes the rank's experts in groups of `num_experts_per_wave`.
     // Total number of waves = ceil(num_experts_per_rank / num_experts_per_wave).
     // (The scheduler asserts this divides evenly.)
-    {
-        const int num_waves = num_experts_per_rank / num_experts_per_wave;
-        static std::unordered_set<std::string> printed_wave_keys;
-        const auto wave_key = fmt::format(
-            "{}-{}-{}-{}", num_experts_per_rank, num_experts_per_wave, num_tokens, num_topk);
-        if (printed_wave_keys.count(wave_key) == 0) {
-            std::cout << "[MegaMoE TRACE host] num_experts_per_rank=" << num_experts_per_rank
-                      << ", num_experts_per_wave=" << num_experts_per_wave
-                      << ", total_waves_per_launch=" << num_waves
-                      << "  (num_tokens=" << num_tokens
-                      << ", num_topk=" << num_topk << ")" << std::endl;
-            printed_wave_keys.insert(wave_key);
-        }
-    }
+    // {
+    //     const int num_waves = num_experts_per_rank / num_experts_per_wave;
+    //     static std::unordered_set<std::string> printed_wave_keys;
+    //     const auto wave_key = fmt::format(
+    //         "{}-{}-{}-{}", num_experts_per_rank, num_experts_per_wave, num_tokens, num_topk);
+    //     if (printed_wave_keys.count(wave_key) == 0) {
+    //         std::cout << "[MegaMoE TRACE host] num_experts_per_rank=" << num_experts_per_rank
+    //                   << ", num_experts_per_wave=" << num_experts_per_wave
+    //                   << ", total_waves_per_launch=" << num_waves
+    //                   << "  (num_tokens=" << num_tokens
+    //                   << ", num_topk=" << num_topk << ")" << std::endl;
+    //         printed_wave_keys.insert(wave_key);
+    //     }
+    // }
     // === [/TRACE] =================================================================
 
     // Thread layout
