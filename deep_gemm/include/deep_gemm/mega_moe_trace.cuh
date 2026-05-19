@@ -42,7 +42,7 @@ struct SmHeader {
     uint64_t t_ns_at_end;       // ← 新增
     uint32_t clock_at_end;
 };
-static_assert(sizeof(SmHeader) == 28, "SmHeader must be 16 bytes");
+static_assert(sizeof(SmHeader) == 32, "SmHeader must be 28 bytes");
 
 // Warp roles. Each role gets its own sub-region in the SM's slice.
 enum WarpRole : uint16_t {
@@ -96,14 +96,14 @@ constexpr uint32_t kEventsPerRole = 256;
 constexpr uint32_t kBytesPerRole  = kEventsPerRole * sizeof(Event);
 
 // Buffer layout, per SM:
-//   [SmHeader: 28 B] [pad to 32]
+//   [SmHeader: 28 B]
 //   [WR_DISPATCH region:    kEventsPerRole * 8 B]
 //   [WR_TMA_LOAD_A region:  kEventsPerRole * 8 B]
 //   [WR_TMA_LOAD_B region:  ...]
 //   [WR_MMA region:         ...]
 //   [WR_EPILOGUE region:    ...]
 //   [WR_COMBINE region:     ...]
-constexpr uint32_t kSmHeaderBytes = 32;  // 28 B header + 4 B pad
+constexpr uint32_t kSmHeaderBytes = 32;  // 32 B header
 constexpr uint32_t kBytesPerSm = kSmHeaderBytes + WR_COUNT * kBytesPerRole;
 
 // Top-level buffer (allocated by host, one big global slab).
