@@ -1,21 +1,3 @@
-#pragma once
-#include <deep_gemm/mega_moe_trace.cuh>
-
-#include <cstdint>
-#include <cutlass/arch/barrier.h>
-#include <cutlass/arch/reg_reconfig.h>
-
-#include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/tma_copy.cuh>
-#include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/comm/barrier.cuh>
-#include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
-#include <deep_gemm/mma/sm100.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
-#include <deep_gemm/ptx/tcgen05.cuh>
-#include <deep_gemm/ptx/tma.cuh>
-#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
 
@@ -61,7 +43,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
-                            const __grid_constant__ trace::TraceBuf trace_buf) {
+                            deep_gemm::trace::EventBuffer trace_buf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -80,13 +62,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
 
-    // === [TRACE v2] Initialize per-SM trace header (records globaltimer + clock baseline) ===
-    // This must run once per SM. Only thread 0 writes; the rest of the block waits on syncthreads.
-    if (thread_idx == 0) {
-        trace::trace_sm_init(trace_buf);
-    }
-    __syncthreads();
-    // === [/TRACE v2] =======================================================================
+    // At the very top of sm100_fp8_fp4_mega_moe_impl, right after thread_idx setup
+    if (warp_idx == 0 and cute::elect_one_sync())
+        deep_gemm::trace::record(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_KERNEL_BEGIN,
+                                deep_gemm::trace::now_ns(), 0, 0xFFFFFFFFu, 0);
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -468,17 +447,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-
-        // === [TRACE v2] Per-warp register counter for dispatch role ===
-        // This counter lives in a register, NOT shared memory, NOT atomic.
-        // It indexes into trace_buf's per-(SM, role=DISPATCH) sub-region.
-        uint32_t dispatch_evt_idx = 0;
-        trace::trace_event(trace_buf, trace::WR_DISPATCH, dispatch_evt_idx,
-                           trace::EV_DISPATCH_START, warp_idx);
-        // === [/TRACE v2] ==============================================
-
-        // TRACE_BEGIN(t_dispatch);
-        // uint64_t t_dispatch = deep_gemm::trace::now_ns();
+        TRACE_BEGIN(t_dispatch);
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
@@ -623,15 +592,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
-        // TRACE_END(trace_buf, deep_gemm::trace::WR_DISPATCH, deep_gemm::trace::EV_DISPATCH_PHASE, t_dispatch, 0xFFFFFFFFu, warp_idx);
-        // if (cute::elect_one_sync())                                   
-        //     deep_gemm::trace::record(trace_buf, deep_gemm::trace::WR_DISPATCH, deep_gemm::trace::EV_DISPATCH_PHASE, t_dispatch, deep_gemm::trace::now_ns(), 0xFFFFFFFFu, warp_idx);              
-
-        // === [TRACE v2] End of dispatch phase on this warp ===
-        trace::trace_event(trace_buf, trace::WR_DISPATCH, dispatch_evt_idx,
-                           trace::EV_DISPATCH_END, warp_idx);
-        // === [/TRACE v2] =====================================
-          
+        TRACE_END(trace_buf, deep_gemm::trace::WR_DISPATCH, deep_gemm::trace::EV_DISPATCH_PHASE, t_dispatch, 0xFFFFFFFFu, warp_idx);
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -694,9 +655,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
-        // === [TRACE v2] Per-warp register counter for TMA-A role ===
-        uint32_t tma_a_evt_idx = 0;
-        // === [/TRACE v2] ===========================================
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -712,29 +670,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
 
-            // === [TRACE v2] Mark start of this expert on TMA-A ===
-            // aux16 = (wave_idx << 8) | local_expert_idx; both small ints, fits in 16 bits
-            const uint16_t expert_aux = static_cast<uint16_t>((scheduler.wave_idx << 8) | (local_expert_idx & 0xff));
-            trace::trace_event(trace_buf, trace::WR_TMA_LOAD_A, tma_a_evt_idx,
-                               block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_START : trace::EV_WAVE_L2_START,
-                               expert_aux);
-            // === [/TRACE v2] =====================================
-
             // Wait the entire token arrival for linear 1
             if (block_phase == sched::BlockPhase::Linear1) {
-                // TRACE_BEGIN(t_wait);
-                /* ========== PRODUCTION CODE — DO NOT REMOVE OR COMMENT THESE 3 LINES ========== */
+                TRACE_BEGIN(t_wait);
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected);
-                /* ============================================================================= */
-                // === [TRACE v2] Wait completed; gap from previous event = wait duration ===
-                trace::trace_event(trace_buf, trace::WR_TMA_LOAD_A, tma_a_evt_idx,
-                                   trace::EV_AFTER_L1_ARRIVAL, expert_aux);
-                // === [/TRACE v2] ==========================================================
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L1_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L1_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
             } else {
-                // TRACE_BEGIN(t_wait);
+                TRACE_BEGIN(t_wait);
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
                 // with L2, but this optimization is negative when `num_experts_per_wave`
@@ -742,31 +686,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // In the future, if `num_experts_per_wave` is not large enough
                 // due to small `num_experts_per_rank`, we may need to add it back or add a switch
                 DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
-                /* ========== PRODUCTION CODE — DO NOT REMOVE OR COMMENT THESE 3 LINES ========== */
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
                 // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
                 // to avoid undefined behavior when `num_k_blocks == 32`
                 const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
                 while (ptx::ld_acq_gpu(ptr) != expected);
-                /* ============================================================================= */
-                // === [TRACE v2] Wait completed ===
-                trace::trace_event(trace_buf, trace::WR_TMA_LOAD_A, tma_a_evt_idx,
-                                   trace::EV_AFTER_L2_ARRIVAL, expert_aux);
-                // === [/TRACE v2] =================
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L2_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_L2_ARRIVAL_WAIT, t_wait, wave, local_expert_idx);
             }
             
-            // NOTE: deliberately NOT tracing inside the k-block loop below. With ~40 k-blocks per
-            // expert, tracing here would flood the buffer and might cause SMEM pressure.
-            // TRACE_BEGIN(t_expert);
+            TRACE_BEGIN(t_expert);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
-                // TRACE_BEGIN(t_eb);
-                /* ========== PRODUCTION CODE — DO NOT REMOVE ========== */
+                TRACE_BEGIN(t_eb);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
-                /* ===================================================== */
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_EMPTY_BARRIER_WAIT, t_eb, wave,
-                //         (local_expert_idx << 16) | k_block_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_EMPTY_BARRIER_WAIT, t_eb, wave,
+                         (local_expert_idx << 16) | k_block_idx);
 
                 // Compute token offset from pool block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -778,7 +712,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (not is_leader_cta)
                     m_idx += scheduler.template get_valid_m<true>() / 2;
 
-                // TRACE_BEGIN(t_tma);
+                TRACE_BEGIN(t_tma);
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
@@ -792,18 +726,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_TMA_LOAD_A_BLOCK, t_tma, wave,
-                //   (local_expert_idx << 16) | k_block_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A, deep_gemm::trace::EV_TMA_LOAD_A_BLOCK, t_tma, wave,
+                  (local_expert_idx << 16) | k_block_idx);
             }
-
-            // === [TRACE v2] Mark end of this expert on TMA-A ===
-            trace::trace_event(trace_buf, trace::WR_TMA_LOAD_A, tma_a_evt_idx,
-                               block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_END : trace::EV_WAVE_L2_END,
-                               expert_aux);
-            // === [/TRACE v2] ===================================
-            //  TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A,
-            //   block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
-            //   t_expert, wave, local_expert_idx);
+             TRACE_END(trace_buf, deep_gemm::trace::WR_TMA_LOAD_A,
+              block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
+              t_expert, wave, local_expert_idx);
         });
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
@@ -877,9 +805,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Persistently schedule over blocks
             uint32_t current_iter_idx = 0;
-            // === [TRACE v2] Per-warp register counter for MMA role ===
-            uint32_t mma_evt_idx = 0;
-            // === [/TRACE v2] =========================================
             scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
                                          const uint32_t& num_k_blocks,
@@ -892,30 +817,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
 
                 const uint32_t wave = scheduler.wave_idx;
-                const uint16_t expert_aux = static_cast<uint16_t>((wave << 8) | (local_expert_idx & 0xff));
-
-                // === [TRACE v2] Mark start of expert on MMA ===
-                trace::trace_event(trace_buf, trace::WR_MMA, mma_evt_idx,
-                                   block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_START : trace::EV_WAVE_L2_START,
-                                   expert_aux);
-                // === [/TRACE v2] ==============================
-
-                // TRACE_BEGIN(t_tmem_wait);
-                /* ========== PRODUCTION CODE — DO NOT REMOVE THIS LINE ========== */
-                /* This is the tmem-accumulator-slot empty wait. Removing it      */
-                /* causes deadlock: MMA overwrites tmem while epilogue is reading.*/
+                
+                TRACE_BEGIN(t_tmem_wait);
                 tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
-                /* =============================================================== */
-                // === [TRACE v2] Wait completed; gap from prev event = tmem-empty wait time ===
-                trace::trace_event(trace_buf, trace::WR_MMA, mma_evt_idx,
-                                   trace::EV_AFTER_TMEM_EMPTY, expert_aux);
-                // === [/TRACE v2] =============================================================
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_TMEM_EMPTY_WAIT, t_tmem_wait, wave, local_expert_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_TMEM_EMPTY_WAIT, t_tmem_wait, wave, local_expert_idx);
 
                 ptx::tcgen05_after_thread_sync();
 
                 // Empty barrier arrival
-                // TRACE_BEGIN(t_umma);
+                TRACE_BEGIN(t_umma);
                 auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
                     auto umma_arrive = [](const uint64_t* barrier) {
                         constexpr uint16_t kCTAMask = (1 << 2) - 1;
@@ -928,7 +838,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
                     __syncwarp();
                 };
-                // TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_UMMA_ISSUE, t_umma, wave, local_expert_idx);
+                TRACE_END(trace_buf, deep_gemm::trace::WR_MMA, deep_gemm::trace::EV_UMMA_ISSUE, t_umma, wave, local_expert_idx);
 
                 // Launch MMAs
                 #pragma unroll 2
@@ -976,12 +886,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
-
-                // === [TRACE v2] Mark end of expert on MMA ===
-                trace::trace_event(trace_buf, trace::WR_MMA, mma_evt_idx,
-                                   block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_END : trace::EV_WAVE_L2_END,
-                                   expert_aux);
-                // === [/TRACE v2] ============================
             });
 
             // To safely deconstruct barriers, we need another round of waits
@@ -1031,9 +935,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
-        // === [TRACE v2] Per-warp register counter for EPILOGUE role ===
-        uint32_t epi_evt_idx = 0;
-        // === [/TRACE v2] ==============================================
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1043,24 +944,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
 
             const uint32_t wave = scheduler.wave_idx;
-            const uint16_t expert_aux = static_cast<uint16_t>((wave << 8) | (local_expert_idx & 0xff));
-
-            // === [TRACE v2] Mark start of expert on EPILOGUE ===
-            trace::trace_event(trace_buf, trace::WR_EPILOGUE, epi_evt_idx,
-                               block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_START : trace::EV_WAVE_L2_START,
-                               expert_aux);
-            // === [/TRACE v2] ===================================
-
-            // TRACE_BEGIN(t_tmem_full);
-            /* ========== PRODUCTION CODE — DO NOT REMOVE THIS LINE ========== */
-            /* Wait for MMA to fill tmem accumulator slot.                    */
+            
+            TRACE_BEGIN(t_tmem_full);
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
-            /* =============================================================== */
-            // === [TRACE v2] Wait completed; gap from prev event = tmem-full wait time ===
-            trace::trace_event(trace_buf, trace::WR_EPILOGUE, epi_evt_idx,
-                               trace::EV_AFTER_TMEM_FULL, expert_aux);
-            // === [/TRACE v2] ============================================================
-            // TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE, deep_gemm::trace::EV_TMEM_FULL_WAIT, t_tmem_full, wave, local_expert_idx);
+            TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE, deep_gemm::trace::EV_TMEM_FULL_WAIT, t_tmem_full, wave, local_expert_idx);
             
             ptx::tcgen05_after_thread_sync();
 
@@ -1071,7 +958,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            // TRACE_BEGIN(t_epi);
+            TRACE_BEGIN(t_epi);
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -1356,25 +1243,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
-
-            // === [TRACE v2] Mark end of expert on EPILOGUE ===
-            trace::trace_event(trace_buf, trace::WR_EPILOGUE, epi_evt_idx,
-                               block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_END : trace::EV_WAVE_L2_END,
-                               expert_aux);
-            // === [/TRACE v2] =================================
         });
 
-        // TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE,
-        //     block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
-        //     t_epi, wave, local_expert_idx);
-
-        // === [TRACE v2] All MoE epilogues done on this warp; combine phase begins ===
-        // Combine uses a separate counter because it lives in the same epilogue warp
-        // but is a logically distinct phase.
-        uint32_t combine_evt_idx = 0;
-        trace::trace_event(trace_buf, trace::WR_COMBINE, combine_evt_idx,
-                           trace::EV_COMBINE_START, epilogue_warp_idx);
-        // === [/TRACE v2] ============================================================
+        TRACE_END(trace_buf, deep_gemm::trace::WR_EPILOGUE,
+            block_phase == sched::BlockPhase::Linear1 ? deep_gemm::trace::EV_EXPERT_L1 : deep_gemm::trace::EV_EXPERT_L2,
+            t_epi, wave, local_expert_idx);
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
@@ -1522,19 +1395,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         }
-
-        // === [TRACE v2] Mark end of combine on this warp ===
-        trace::trace_event(trace_buf, trace::WR_COMBINE, combine_evt_idx,
-                           trace::EV_COMBINE_END, epilogue_warp_idx);
-        // === [/TRACE v2] ===================================
     }
-    trace_sm_finalize(trace_buf);
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
 #endif
-
-    trace_sm_finalize(trace_buf);
 }
 
 } // namespace deep_gemm

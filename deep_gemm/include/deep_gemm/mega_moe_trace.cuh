@@ -1,30 +1,50 @@
 #pragma once
 //
-// Fine-grained timing for MegaMoE pipeline.
-// All warps in all SMs append events into a single global ringbuffer.
-// Host side replays them after kernel completion.
+// Lightweight per-SM trace ringbuffer for MegaMoE.
 //
-// Enable by defining DG_MEGA_MOE_TIMING before including any MegaMoE header.
+// Design goals:
+//   1. ZERO atomicAdd on the hot path (per-warp counter lives in a register)
+//   2. ZERO globaltimer reads on the hot path (only at kernel entry, twice per SM)
+//   3. Compact 8-byte events: just (event_id, clock_cycle_lo32)
+//   4. Per-SM region with statically sized capacity — writes from different SMs
+//      never touch the same cache line, so L2 pollution is bounded.
+//
+// Cost per record() call: ~8-12 ns (one clock() + one 8-byte store).
+// At ~30 events/wave * 148 SMs = ~4400 events/launch, total HBM traffic ~35 KB.
 //
 
 #include <cstdint>
-#include <cstdio>
 
 namespace deep_gemm::trace {
 
-// Per-event fixed-width record. Keep this small (32 B) so the buffer is cheap.
+// 8 bytes per event. Two fields packed.
+//   high 32 bits: clock_lo (cycle counter, low 32 bits — wraps ~every 2 sec at 2 GHz)
+//   low  16 bits: event_id
+//   bits 16..31: aux16  (e.g. wave_idx << 8 | expert_idx, both small)
+//
+// We deliberately drop sm_id, warp_role, and 64-bit timestamps. Those are
+// reconstructed on the host from (a) the base header below and (b) the
+// region in the buffer the event lives in.
 struct Event {
-    uint64_t t_start;       // %globaltimer ns
-    uint64_t t_end;         // %globaltimer ns (0 if it's a point event)
-    uint32_t sm_id;         // blockIdx.x
-    uint16_t warp_role;     // one of WarpRole below
-    uint16_t event_id;      // one of EventId below
-    uint32_t wave_idx;      // current wave index (or 0xFFFFFFFF if N/A)
-    uint32_t aux;           // role-specific (e.g. expert_idx, stage_idx, k_block_idx)
+    uint16_t event_id;
+    uint16_t aux16;
+    uint32_t clock_lo;
 };
-static_assert(sizeof(Event) == 32, "Event must be 32 bytes");
+static_assert(sizeof(Event) == 8, "Event must be 8 bytes");
 
-// Warp roles. Use the same ids the kernel already implies.
+// Per-SM header — written ONCE at kernel entry by warp 0 of each SM.
+// Used by the host to convert clock cycles to nanoseconds and align across SMs.
+struct SmHeader {
+    uint64_t t_ns_at_start;     // globaltimer reading at kernel entry on THIS sm
+    uint32_t clock_at_start;    // clock() reading at kernel entry on THIS sm
+    uint32_t n_events_written;  // total events written by all warps in this SM
+                                // (sum of per-warp counters, filled at kernel exit)
+    uint64_t t_ns_at_end;       // ← 新增
+    uint32_t clock_at_end;
+};
+static_assert(sizeof(SmHeader) == 16, "SmHeader must be 16 bytes");
+
+// Warp roles. Each role gets its own sub-region in the SM's slice.
 enum WarpRole : uint16_t {
     WR_DISPATCH    = 0,
     WR_TMA_LOAD_A  = 1,
@@ -32,110 +52,155 @@ enum WarpRole : uint16_t {
     WR_MMA         = 3,
     WR_EPILOGUE    = 4,
     WR_COMBINE     = 5,
+    WR_COUNT       = 6,
 };
 
-// Event ids. Add more as needed; just keep total < 65k.
 enum EventId : uint16_t {
-    // Lifecycle
-    EV_KERNEL_BEGIN          = 0,
-    EV_KERNEL_END            = 1,
+    // Lifecycle (point events)
+    EV_KERNEL_BEGIN     = 0,
+    EV_KERNEL_END       = 1,
 
-    // Wave & phase
-    EV_WAVE_L1_PHASE         = 10,   // interval: one wave's L1 phase on this warp
-    EV_WAVE_L2_PHASE         = 11,
-    EV_EXPERT_L1             = 12,   // interval: one expert's L1 blocks on this warp
-    EV_EXPERT_L2             = 13,
+    // Wave & phase boundaries (point events — emit at transition time)
+    EV_WAVE_L1_START    = 10,
+    EV_WAVE_L1_END      = 11,
+    EV_WAVE_L2_START    = 12,
+    EV_WAVE_L2_END      = 13,
+    EV_EXPERT_START     = 14,   // per-expert granularity, aux16 = expert_idx
+    EV_EXPERT_END       = 15,
 
-    // Sync primitives (these are the ones to watch carefully)
-    EV_L1_ARRIVAL_WAIT       = 20,   // spin on workspace.get_l1_arrival_count_ptr
-    EV_L2_ARRIVAL_WAIT       = 21,   // spin on workspace.get_l2_arrival_mask_ptr
-    EV_EMPTY_BARRIER_WAIT    = 22,   // pipeline empty barrier
-    EV_FULL_BARRIER_WAIT     = 23,   // pipeline full barrier
-    EV_TMEM_FULL_WAIT        = 24,   // tmem accumulator full
-    EV_TMEM_EMPTY_WAIT       = 25,   // tmem accumulator empty
-    EV_DISPATCH_EPILOGUE_BAR = 26,   // dispatch↔epilogue cross-section barrier
+    // Sync waits — emit one event AFTER the wait completes; the host computes
+    // wait duration as (this event's cycle) − (previous event's cycle).
+    // No need to bracket with two events.
+    EV_AFTER_L1_ARRIVAL = 20,
+    EV_AFTER_L2_ARRIVAL = 21,
+    EV_AFTER_EMPTY_BAR  = 22,
+    EV_AFTER_FULL_BAR   = 23,
+    EV_AFTER_TMEM_FULL  = 24,
+    EV_AFTER_TMEM_EMPTY = 25,
 
-    // Per-block TMA / MMA
-    EV_TMA_LOAD_A_BLOCK      = 30,   // one (m_block, k_block) TMA copy for A+SFA
-    EV_TMA_LOAD_B_BLOCK      = 31,
-    EV_UMMA_ISSUE            = 32,   // one UMMA instruction sequence
+    // Per-block markers (use sparingly — these can flood the buffer)
+    EV_TMA_A_DONE       = 30,
+    EV_UMMA_ISSUED      = 32,
 
-    // Dispatch side
-    EV_DISPATCH_TOKEN        = 40,   // one token pulled from a remote rank
-    EV_DISPATCH_PHASE        = 41,   // entire dispatch phase on this warp
+    EV_DISPATCH_START   = 33,
+    EV_DISPATCH_END     = 34,
 
-    // Combine side (L2 epilogue → NVLink writeback)
-    EV_COMBINE_TOKEN         = 50,
-    EV_COMBINE_PHASE         = 51,
+    EV_COMBINE_START    = 35,
+    EV_COMBINE_END      = 36,
 };
 
-constexpr uint32_t kMaxEvents = 1u << 20;   // 1M events ≈ 32 MiB ringbuffer
+// Capacity per (SM, warp_role). Adjust based on expected events.
+// At 256 events/role * 6 roles * 8 bytes = 12 KB per SM.
+// On 148 SMs: ~1.8 MB total. Sized to stay in L2 footprint.
+constexpr uint32_t kEventsPerRole = 256;
+constexpr uint32_t kBytesPerRole  = kEventsPerRole * sizeof(Event);
 
-struct EventBuffer {
-    Event*    events;
-    uint32_t* counter;     // atomic append index
-    uint32_t  capacity;
+// Buffer layout, per SM:
+//   [SmHeader: 16 B] [pad to 32]
+//   [WR_DISPATCH region:    kEventsPerRole * 8 B]
+//   [WR_TMA_LOAD_A region:  kEventsPerRole * 8 B]
+//   [WR_TMA_LOAD_B region:  ...]
+//   [WR_MMA region:         ...]
+//   [WR_EPILOGUE region:    ...]
+//   [WR_COMBINE region:     ...]
+constexpr uint32_t kSmHeaderBytes = 32;  // 16 B header + 16 B pad
+constexpr uint32_t kBytesPerSm = kSmHeaderBytes + WR_COUNT * kBytesPerRole;
+
+// Top-level buffer (allocated by host, one big global slab).
+struct TraceBuf {
+    uint8_t* data;        // size = num_sms * kBytesPerSm
+    uint32_t num_sms;
 };
 
 #ifdef __CUDA_ARCH__
 
-// Read the global timer.
-__device__ __forceinline__ uint64_t now_ns() {
+__device__ __forceinline__ uint32_t clock_lo() {
+    uint32_t c;
+    asm volatile("mov.u32 %0, %%clock;" : "=r"(c));
+    return c;
+}
+
+__device__ __forceinline__ uint64_t globaltimer_ns() {
     uint64_t t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
 
-// Append a single event. Returns false if buffer is full (silently drops).
-// Only one thread per warp should call this (use cute::elect_one_sync or lane 0).
-__device__ __forceinline__ bool record(
-    const EventBuffer& buf,
-    uint16_t warp_role, uint16_t event_id,
-    uint64_t t_start, uint64_t t_end,
-    uint32_t wave_idx, uint32_t aux)
-{
-    uint32_t idx = atomicAdd(buf.counter, 1u);
-    if (idx >= buf.capacity) return false;
-    Event& e = buf.events[idx];
-    e.t_start   = t_start;
-    e.t_end     = t_end;
-    e.sm_id     = blockIdx.x;
-    e.warp_role = warp_role;
-    e.event_id  = event_id;
-    e.wave_idx  = wave_idx;
-    e.aux       = aux;
-    return true;
+// Get pointer to this SM's header. Call from any thread.
+__device__ __forceinline__ SmHeader* sm_header(const TraceBuf& buf) {
+    return reinterpret_cast<SmHeader*>(buf.data + blockIdx.x * kBytesPerSm);
 }
 
-#endif // __CUDA_ARCH__
+// Get base pointer to this SM's region for `role`.
+__device__ __forceinline__ Event* role_region(const TraceBuf& buf, uint32_t role) {
+    return reinterpret_cast<Event*>(
+        buf.data + blockIdx.x * kBytesPerSm + kSmHeaderBytes + role * kBytesPerRole);
+}
 
-} // namespace deep_gemm::trace
+__device__ __forceinline__ void trace_sm_finalize(const TraceBuf& buf) {
+    if (buf.data == nullptr) return;
+    if (threadIdx.x == 0) {
+        SmHeader* h = sm_header(buf);
+        h->t_ns_at_end  = globaltimer_ns();
+        h->clock_at_end = clock_lo();
+    }
+}
 
-// === Scoped interval helper ====================================================
-// Usage:
-//   TRACE_INTERVAL(trace_buf, WR_TMA_LOAD_A, EV_TMA_LOAD_A_BLOCK, wave_idx, expert_idx) {
-//       // code to be timed
-//   }
-// Expands to: take t0; run block; if elected lane, take t1 and record.
+// === The hot-path API ====================================================
 //
-// Important: this only records from ONE thread per warp (lane 0 after elect_one).
-// Don't put it inside divergent control flow within a warp.
+// `local_idx` is a uint32_t kept in REGISTER, one per (warp-role, thread).
+// Only ONE thread per warp (elected lane) actually writes. Other lanes still
+// run clock() but discard the result — it's cheap and avoids divergence.
+//
+// Usage:
+//
+//   uint32_t mma_evt_idx = 0;   // declared once at start of warp role
+//   ...
+//   trace_event(trace_buf, WR_MMA, mma_evt_idx, EV_AFTER_TMEM_FULL, wave_idx);
+//
+__device__ __forceinline__ void trace_event(
+    const TraceBuf& buf,
+    uint32_t role,
+    uint32_t& local_idx,        // register counter, incremented in-place
+    uint16_t event_id,
+    uint16_t aux16)
+{
+    if (buf.data == nullptr)
+        return;
+    // Read clock unconditionally (it's a single SASS instruction, ~1 cycle).
+    // Branching on elect_one_sync first would cause divergent stall instead.
+    uint32_t c = clock_lo();
+    if (__builtin_expect(local_idx >= kEventsPerRole, 0)) return;
+    // Only the elected lane writes. Other lanes skip the store.
+    // Using a per-warp ballot is cheaper than `if (lane == 0)`.
+    bool is_writer = (threadIdx.x & 31u) == 0;   // lane 0 of the warp
+    if (is_writer) {
+        Event* region = role_region(buf, role);
+        region[local_idx] = Event{event_id, aux16, c};
+    }
+    local_idx++;  // ALL lanes increment (it's a register; cheap; keeps them in sync)
+}
 
-#ifdef __CUDA_ARCH__
-  #define TRACE_BEGIN(_t0)                                                     \
-      uint64_t _t0 = ::deep_gemm::trace::now_ns()
-  #define TRACE_END(_buf, _role, _ev, _t0, _wave, _aux)                        \
-      do {                                                                     \
-          if (cute::elect_one_sync()) {                                        \
-              ::deep_gemm::trace::record(                                      \
-                  (_buf), (_role), (_ev), (_t0),                               \
-                  ::deep_gemm::trace::now_ns(), (_wave), (_aux));              \
-          }                                                                    \
-      } while (0)
-#else
-  #define TRACE_BEGIN(_t0)                              ((void)0)
-  #define TRACE_END(_buf, _role, _ev, _t0, _w, _aux)    ((void)0)
-#endif
+// Variant for bracketing: write the start cycle into a register, record
+// "after" event later. Use when you genuinely need the start (rare; usually
+// the previous event's cycle is enough).
+__device__ __forceinline__ uint32_t trace_clock_now() {
+    return clock_lo();
+}
 
-#define TRACE_BEGIN(_t0)                            ((void)0)
-#define TRACE_END(_buf, _role, _ev, _t0, _w, _aux)  ((void)0)
+// Called by warp 0 of each SM at kernel entry. Records the (globaltimer, clock)
+// pair so the host can do cycle→ns conversion per SM.
+__device__ __forceinline__ void trace_sm_init(const TraceBuf& buf) {
+    if (buf.data == nullptr)
+        return;
+    if (threadIdx.x == 0) {
+        SmHeader* h = sm_header(buf);
+        h->t_ns_at_start  = globaltimer_ns();
+        h->clock_at_start = clock_lo();
+        h->n_events_written = 0;  // filled later if you care
+    }
+}
+
+#endif  // __CUDA_ARCH__
+
+}  // namespace deep_gemm::trace

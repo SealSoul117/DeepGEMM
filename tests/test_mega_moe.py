@@ -220,6 +220,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json')
     # t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
+    if args.dump_mega_moe_trace:
+        rank = dist.get_rank()
+        deep_gemm.init_mega_moe_trace_buffer(148)
+        deep_gemm.reset_mega_moe_trace()   # 清零,这样下次 launch 是一份干净的 trace
+        run_fused()                         # 单次 launch,只为了收 trace 数据
+        torch.cuda.synchronize()
+        
+        deep_gemm.dump_mega_moe_trace(f"trace_v2_rank{rank}.bin")
+        print(f"dumped trace to trace_v2_rank{rank}.bin")
+
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
     tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
@@ -267,6 +277,7 @@ if __name__ == '__main__':
 
     # Resource settings
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
+    parser.add_argument('--dump-mega-moe-trace', action='store_true', help='run mega-moe trace')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
 
     # Model settings

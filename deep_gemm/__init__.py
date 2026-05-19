@@ -70,6 +70,10 @@ try:
         tf32_hc_prenorm_gemm,
         # Layout kernels
         transform_sf_into_required_layout,
+
+        init_mega_moe_trace_buffer,
+        reset_mega_moe_trace,
+        dump_mega_moe_trace,
     )
 
     # Some alias for legacy supports
