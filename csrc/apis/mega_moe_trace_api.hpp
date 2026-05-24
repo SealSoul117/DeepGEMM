@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
+#include <filesystem>
 
 #include <deep_gemm/mega_moe_trace.cuh>
 
@@ -55,6 +56,18 @@ inline void dump_mega_moe_trace(const std::string& path) {
     if (not s.initialized) {
         throw std::runtime_error("dump_mega_moe_trace called before init_mega_moe_trace_buffer");
     }
+
+        // Ensure parent directory exists
+    auto parent = std::filesystem::path(path).parent_path();
+    if (not parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            throw std::runtime_error("dump_mega_moe_trace: cannot create directory "
+                                     + parent.string() + ": " + ec.message());
+        }
+    }
+    
     cudaDeviceSynchronize();  // ensure all enqueued launches are done
     std::vector<uint8_t> raw(s.bytes);
     cudaError_t err = cudaMemcpy(raw.data(), s.device_buf, s.bytes, cudaMemcpyDeviceToHost);

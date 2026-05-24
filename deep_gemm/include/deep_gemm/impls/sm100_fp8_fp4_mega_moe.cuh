@@ -879,6 +879,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t current_iter_idx = 0;
             // === [TRACE v2] Per-warp register counter for MMA role ===
             uint32_t mma_evt_idx = 0;
+            uint32_t sched_evt_idx = 0;
             // === [/TRACE v2] =========================================
             scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
@@ -899,6 +900,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                    block_phase == sched::BlockPhase::Linear1 ? trace::EV_WAVE_L1_START : trace::EV_WAVE_L2_START,
                                    expert_aux);
                 // === [/TRACE v2] ==============================
+
+                trace::trace_tile_assignment(trace_buf, sched_evt_idx,
+                                            block_phase == sched::BlockPhase::Linear1,    // is_l1_phase
+                                            wave, local_expert_idx,
+                                            m_block_idx, n_block_idx);
 
                 // TRACE_BEGIN(t_tmem_wait);
                 /* ========== PRODUCTION CODE — DO NOT REMOVE THIS LINE ========== */

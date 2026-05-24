@@ -3,6 +3,7 @@ cmake-build-*
 .DS_Store
 build
 dist
+profile
 *.egg-info
 *.pyc
 
@@ -22,3 +23,5 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+
+/install.sh

@@ -42,7 +42,7 @@ struct SmHeader {
     uint64_t t_ns_at_end;       // ← 新增
     uint32_t clock_at_end;
 };
-static_assert(sizeof(SmHeader) == 32, "SmHeader must be 28 bytes");
+static_assert(sizeof(SmHeader) == 32, "SmHeader must be 32 bytes");
 
 // Warp roles. Each role gets its own sub-region in the SM's slice.
 enum WarpRole : uint16_t {
@@ -52,7 +52,8 @@ enum WarpRole : uint16_t {
     WR_MMA         = 3,
     WR_EPILOGUE    = 4,
     WR_COMBINE     = 5,
-    WR_COUNT       = 6,
+    WR_SCHEDULER   = 6,
+    WR_COUNT       = 7,
 };
 
 enum EventId : uint16_t {
@@ -87,12 +88,15 @@ enum EventId : uint16_t {
 
     EV_COMBINE_START    = 35,
     EV_COMBINE_END      = 36,
+
+    EV_TILE_L1          = 40,
+    EV_TILE_L2          = 41,
 };
 
 // Capacity per (SM, warp_role). Adjust based on expected events.
 // At 256 events/role * 6 roles * 8 bytes = 12 KB per SM.
 // On 148 SMs: ~1.8 MB total. Sized to stay in L2 footprint.
-constexpr uint32_t kEventsPerRole = 256;
+constexpr uint32_t kEventsPerRole = 1024;
 constexpr uint32_t kBytesPerRole  = kEventsPerRole * sizeof(Event);
 
 // Buffer layout, per SM:
@@ -144,6 +148,40 @@ __device__ __forceinline__ void trace_sm_finalize(const TraceBuf& buf) {
         h->t_ns_at_end  = globaltimer_ns();
         h->clock_at_end = clock_lo();
     }
+}
+
+// Record a tile assignment. Stores all scheduling info in the 8-byte Event slot:
+//   event_id = EV_TILE_L1 or EV_TILE_L2
+//   aux16    = (m_block << 8) | n_block            (assuming both < 256)
+//   clock_lo = (wave << 24) | (expert << 16) | seq (lo 16 bits of local_idx)
+//
+// Note: the "clock_lo" field's true timestamp meaning is sacrificed here —
+// for tile assignment we care about the WHAT (which tile) and the ORDER
+// (sequence number), not the WHEN.
+//
+// Only one thread per warp should call. Best place: MMA warp's elected lane.
+__device__ __forceinline__ void trace_tile_assignment(
+    const TraceBuf& buf,
+    uint32_t& local_idx,
+    bool is_l1_phase,
+    uint32_t wave,
+    uint32_t expert,
+    uint32_t m_block,
+    uint32_t n_block)
+{
+    if (buf.data == nullptr) return;
+    if (local_idx >= kEventsPerRole) return;
+    bool is_writer = (threadIdx.x & 31u) == 0;
+    if (is_writer) {
+        Event* region = role_region(buf, WR_SCHEDULER);
+        uint16_t ev_id = is_l1_phase ? EV_TILE_L1 : EV_TILE_L2;
+        uint16_t aux16 = static_cast<uint16_t>(((m_block & 0xff) << 8) | (n_block & 0xff));
+        uint32_t encoded = ((wave & 0xff) << 24)
+                         | ((expert & 0xff) << 16)
+                         | (local_idx & 0xffff);
+        region[local_idx] = Event{ev_id, aux16, encoded};
+    }
+    local_idx++;
 }
 
 // === The hot-path API ====================================================

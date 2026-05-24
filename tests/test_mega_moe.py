@@ -206,6 +206,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     #     create_inputs()
 
     create_inputs()
+    deep_gemm.init_mega_moe_trace_buffer(148)
 
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -222,12 +223,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     if args.dump_mega_moe_trace:
         rank = dist.get_rank()
-        deep_gemm.init_mega_moe_trace_buffer(148)
-        deep_gemm.reset_mega_moe_trace()   # 清零,这样下次 launch 是一份干净的 trace
-        run_fused()                         # 单次 launch,只为了收 trace 数据
         torch.cuda.synchronize()
         
-        deep_gemm.dump_mega_moe_trace(f"trace_v2_rank{rank}.bin")
+        deep_gemm.dump_mega_moe_trace(f"/home/boyuan/DeepGEMM/profile/token_{num_tokens}/trace_rank{rank}.bin")
         print(f"dumped trace to trace_v2_rank{rank}.bin")
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
